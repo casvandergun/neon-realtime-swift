@@ -1,7 +1,7 @@
 import Foundation
 
 /// The JSON response from an application endpoint that seals a live SQL query.
-public struct NeonSealedQuery: Codable, Sendable {
+public struct SealedLiveQuery: Codable, Sendable {
     public let capability: String
     public let queryFingerprint: String
     /// Unix time in milliseconds.

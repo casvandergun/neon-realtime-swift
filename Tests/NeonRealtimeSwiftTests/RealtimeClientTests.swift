@@ -29,9 +29,9 @@ private let admission = """
         baselineEnd(count: 1),
         #"{"type":"progress","mvcc":\#(visibility)}"#,
     ])
-    let client = NeonRealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
     let query = try JSONDecoder().decode(
-        NeonSealedQuery.self,
+        SealedLiveQuery.self,
         from: Data(#"{"capability":"sealed","queryFingerprint":"fingerprint","expiresAt":1234567890000}"#.utf8)
     )
     #expect(query.expiresAt == 1_234_567_890_000)
@@ -78,8 +78,8 @@ private let admission = """
 @Test(arguments: [nil, "neon.realtime.v1"] as [String?])
 func subscriptionRequiresV2BeforeSendingTheCapability(selectedSubprotocol: String?) async throws {
     let socket = ScriptedWebSocket([#"{"type":"ready"}"#], selectedSubprotocol: selectedSubprotocol)
-    let client = NeonRealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
-    let query = NeonSealedQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let query = SealedLiveQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
 
     await #expect(throws: NeonRealtimeError.unexpectedSubprotocol(actual: selectedSubprotocol)) {
         var events = client.subscribe(to: query).makeAsyncIterator()
@@ -153,8 +153,8 @@ func subscriptionRequiresV2BeforeSendingTheCapability(selectedSubprotocol: Strin
         #"{"type":"open","publication_id":"p"}"#,
         results(index: 0, changes: #"[{"op":"upsert","row_key":"\#(rowA)","values":["uncommitted",null]}]"#),
     ])
-    let client = NeonRealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
-    let query = NeonSealedQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let query = SealedLiveQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
     var events = client.subscribe(to: query).makeAsyncIterator()
     guard case .snapshot(let snapshot)? = try await events.next() else {
         Issue.record("Expected the complete snapshot before disconnect")
@@ -232,8 +232,8 @@ func subscriptionPreservesCancellationRetryHint() async throws {
         admission,
         #"{"type":"subscription_error","live_id":"7","code":"upstream_cancelled","message":"Cancelled","retry_after_ms":4500}"#,
     ])
-    let client = NeonRealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
-    let query = NeonSealedQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let query = SealedLiveQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
     await #expect(throws: NeonRealtimeError.server(
         code: "upstream_cancelled",
         message: "Cancelled",
@@ -248,12 +248,12 @@ func subscriptionPreservesCancellationRetryHint() async throws {
 @Test(.timeLimit(.minutes(1)))
 func idleSocketProbesAndTimesOutWhenThePeerStopsResponding() async throws {
     let socket = WaitingWebSocket(initialFrames: [#"{"type":"ready"}"#])
-    let client = NeonRealtimeClient(
+    let client = RealtimeClient(
         url: try #require(URL(string: "wss://example.com/live")),
         heartbeatIdle: .milliseconds(20),
         heartbeatTimeout: .milliseconds(500)
     ) { _ in socket }
-    let query = NeonSealedQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
+    let query = SealedLiveQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
 
     let consumer = Task {
         var events = client.subscribe(to: query).makeAsyncIterator()
@@ -276,8 +276,8 @@ func idleSocketProbesAndTimesOutWhenThePeerStopsResponding() async throws {
 @Test(.timeLimit(.minutes(1)))
 func cancellingIterationClosesTheSocket() async throws {
     let socket = WaitingWebSocket()
-    let client = NeonRealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
-    let query = NeonSealedQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let query = SealedLiveQuery(capability: "sealed", queryFingerprint: "fingerprint", expiresAt: 1)
 
     let consumer = Task {
         for try await _ in client.subscribe(to: query) {

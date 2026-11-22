@@ -2,7 +2,7 @@ import Foundation
 
 private let neonRealtimeSubprotocol = "neon.realtime.v2"
 
-public struct NeonRealtimeClient: Sendable {
+public struct RealtimeClient: Sendable {
     public let url: URL
     private let makeSocket: @Sendable (URL) -> any NeonWebSocket
     private let heartbeatIdle: Duration
@@ -24,10 +24,18 @@ public struct NeonRealtimeClient: Sendable {
         self.makeSocket = makeSocket
     }
 
+    /// Creates a logical subscription. The loader supplies a fresh capability for
+    /// the same query on every connection attempt.
+    public func subscription(
+        loadQuery: @escaping @Sendable () async throws -> SealedLiveQuery
+    ) -> RawLiveQuerySubscription {
+        RawLiveQuerySubscription(loadQuery: loadQuery, subscribe: subscribe(to:))
+    }
+
     /// Opens a connection for one sealed query and emits updates in application order.
     /// Cancel the consuming task to close the connection. On expiry or disconnect,
     /// subscribe again with a fresh sealed query to obtain a replacement snapshot.
-    public func subscribe(to query: NeonSealedQuery) -> AsyncThrowingStream<NeonRealtimeEvent, Error> {
+    public func subscribe(to query: SealedLiveQuery) -> AsyncThrowingStream<NeonRealtimeEvent, Error> {
         AsyncThrowingStream { continuation in
             guard isSupportedEndpoint else {
                 continuation.finish(throwing: NeonRealtimeError.invalidEndpoint)

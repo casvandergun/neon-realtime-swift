@@ -14,14 +14,35 @@ dependencies: [
 
 ## Subscribing
 
+A `RealtimeClient` creates a `RawLiveQuerySubscription` for a `SealedLiveQuery`. The subscription keeps streaming across recoverable disconnects. Its loader supplies a fresh capability for the same query on each connection attempt.
+
+```swift
+import NeonRealtimeSwift
+
+let client = RealtimeClient(url: realtimeWebSocketURL)
+let subscription = client.subscription(loadQuery: api.sealTodos)
+for try await update in await subscription.updates() {
+    switch update {
+    case .stateChanged(let state):
+        showStatus(state)
+    case .event(let event):
+        applyRealtimeEvent(event)
+    }
+}
+```
+
+A replacement snapshot starts a new row ID namespace. Call `await subscription.stop()` or cancel the consuming task to stop sync. The same handle can start again with the same query. For a failed HTTP seal request, throw `NeonRealtimeSubscriptionError.sealHTTPStatus(statusCode)` so the session can classify 408, 429, and 5xx as retryable.
+
+### Single connection attempt
+
 Decode the sealed query from your authenticated backend and connect to the branch's Realtime WebSocket URL. Keep the signing secret on the backend.
 
 ```swift
 import Foundation
 import NeonRealtimeSwift
 
-let query = try JSONDecoder().decode(NeonSealedQuery.self, from: sealedQueryData)
-let client = NeonRealtimeClient(url: realtimeWebSocketURL)
+let query = try JSONDecoder().decode(SealedLiveQuery.self, from: sealedQueryData)
+let client = RealtimeClient(url: realtimeWebSocketURL)
 
 for try await event in client.subscribe(to: query) {
     switch event {

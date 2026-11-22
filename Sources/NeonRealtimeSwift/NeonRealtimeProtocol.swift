@@ -1,7 +1,7 @@
 import Foundation
 
 // Neon encodes these integers as canonical nonzero decimal strings.
-struct NeonWireID: Decodable, Equatable {
+struct NeonWireID: Decodable, Equatable, Sendable {
     let value: UInt64
 
     init(from decoder: any Decoder) throws {
@@ -43,7 +43,7 @@ enum NeonServerMessage: Decodable {
     case progress(NeonTransactionVisibility)
     case warning
     case failure(Failure)
-    case renewed
+    case renewed(liveID: NeonWireID)
     case unsubscribed
 
     struct Admission: Decodable {
@@ -244,7 +244,7 @@ enum NeonServerMessage: Decodable {
         case .connectionError:
             self = .failure(try Failure(from: decoder))
         case .renewed:
-            self = .renewed
+            self = .renewed(liveID: try container.decode(NeonWireID.self, forKey: .liveId))
         case .unsubscribed:
             self = .unsubscribed
         }

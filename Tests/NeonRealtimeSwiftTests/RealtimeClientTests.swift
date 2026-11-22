@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import NeonRealtimeSwift
 import Testing
 
@@ -292,6 +293,230 @@ func cancellingIterationClosesTheSocket() async throws {
     try #require(await closed.next() != nil)
 }
 
+@Test(.timeLimit(.minutes(1)))
+func twoRenewalsKeepTheSocketAndRowIDsAndContinueTheChangeSequence() async throws {
+    let socket = WaitingWebSocket(initialFrames: renewalBaseline)
+    let loads = OSAllocatedUnfairLock(initialState: 0)
+    let socketsOpened = OSAllocatedUnfairLock(initialState: 0)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in
+        socketsOpened.withLock { $0 += 1 }
+        return socket
+    }
+    let subscription = client.subscription {
+        loads.withLock { count in
+            count += 1
+            switch count {
+            case 1: return renewalQuery("initial", expiresIn: 500)
+            case 2: return renewalQuery("replacement", expiresIn: 1_200)
+            default: return renewalQuery("second-replacement", expiresIn: 60_000)
+            }
+        }
+    }
+
+    var updates = await subscription.updates().makeAsyncIterator()
+    #expect(try await updates.next() == .stateChanged(.connecting))
+    guard case .event(.snapshot(let baseline)) = try await updates.next() else {
+        Issue.record("Expected the initial snapshot")
+        await subscription.stop()
+        return
+    }
+    #expect(baseline.rows.first?.rowID == rowA)
+    #expect(try await updates.next() == .stateChanged(.live))
+
+    var sent = socket.sentMessages.stream.makeAsyncIterator()
+    #expect(await sent.next()?["type"] == "client_info")
+    #expect(await sent.next() == ["type": "subscribe", "request_id": "1", "authorization": "initial"])
+    #expect(await sent.next() == ["type": "renew", "live_id": "7", "authorization": "replacement"])
+    // A committed batch may arrive before the renewal acknowledgement. Its
+    // sequence and row IDs remain valid both before and after that acknowledgement.
+    socket.deliver(#"{"type":"open","publication_id":"first"}"#)
+    socket.deliver(results(index: 0, publicationID: "first", transactionID: "105", changes: "[]"))
+    socket.deliver(commit(count: 1, publicationID: "first"))
+    socket.deliver(#"{"type":"renewed","live_id":"7"}"#)
+    socket.deliver(#"{"type":"open","publication_id":"second"}"#)
+    socket.deliver(results(index: 0, sequence: 6, publicationID: "second", transactionID: "106",
+                           changes: #"[{"op":"remove","row_key":"\#(rowA)"}]"#))
+    socket.deliver(commit(count: 1, publicationID: "second"))
+
+    #expect(try await updates.next() == .event(.changes(
+        NeonChangeBatch(changes: [], transactionIDs: ["105"], lsn: "1/2")
+    )))
+    #expect(try await updates.next() == .event(.changes(
+        NeonChangeBatch(changes: [.remove(rowID: rowA)], transactionIDs: ["106"], lsn: "1/2")
+    )))
+    #expect(await sent.next() == ["type": "renew", "live_id": "7", "authorization": "second-replacement"])
+    socket.deliver(#"{"type":"renewed","live_id":"7"}"#)
+    socket.deliver(#"{"type":"open","publication_id":"third"}"#)
+    socket.deliver(results(index: 0, sequence: 7, publicationID: "third", transactionID: "107", changes: "[]"))
+    socket.deliver(commit(count: 1, publicationID: "third"))
+    #expect(try await updates.next() == .event(.changes(
+        NeonChangeBatch(changes: [], transactionIDs: ["107"], lsn: "1/2")
+    )))
+    #expect(await subscription.state == .live)
+    #expect(socketsOpened.withLock { $0 } == 1)
+    #expect(loads.withLock { $0 } == 3)
+    await subscription.stop()
+}
+
+@Test(.timeLimit(.minutes(1)))
+func renewalRetriesATransientSealFailureWhileChangesKeepArriving() async throws {
+    let socket = WaitingWebSocket(initialFrames: renewalBaseline)
+    let loads = OSAllocatedUnfairLock(initialState: 0)
+    let socketsOpened = OSAllocatedUnfairLock(initialState: 0)
+    let failedSeal = AsyncStream<Void>.makeStream()
+    let resumeReseal = AsyncStream<Void>.makeStream()
+    defer { resumeReseal.continuation.finish() }
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in
+        socketsOpened.withLock { $0 += 1 }
+        return socket
+    }
+    let subscription = client.subscription {
+        let attempt = loads.withLock { count in
+            count += 1
+            return count
+        }
+        switch attempt {
+        case 1:
+            return renewalQuery("initial", expiresIn: 8_000)
+        case 2:
+            failedSeal.continuation.finish()
+            throw NeonRealtimeSubscriptionError.sealHTTPStatus(503)
+        default:
+            for await _ in resumeReseal.stream {}
+            return renewalQuery("replacement", expiresIn: 60_000)
+        }
+    }
+
+    var updates = await subscription.updates().makeAsyncIterator()
+    #expect(try await updates.next() == .stateChanged(.connecting))
+    guard case .event(.snapshot) = try await updates.next() else {
+        Issue.record("Expected the initial snapshot")
+        await subscription.stop()
+        return
+    }
+    #expect(try await updates.next() == .stateChanged(.live))
+    for await _ in failedSeal.stream {}
+
+    socket.deliver(#"{"type":"open","publication_id":"before-retry"}"#)
+    socket.deliver(results(index: 0, publicationID: "before-retry", transactionID: "105", changes: "[]"))
+    socket.deliver(commit(count: 1, publicationID: "before-retry"))
+    #expect(try await updates.next() == .event(.changes(
+        NeonChangeBatch(changes: [], transactionIDs: ["105"], lsn: "1/2")
+    )))
+    #expect(await subscription.state == .live)
+    resumeReseal.continuation.finish()
+
+    var sent = socket.sentMessages.stream.makeAsyncIterator()
+    #expect(await sent.next()?["type"] == "client_info")
+    #expect(await sent.next() == ["type": "subscribe", "request_id": "1", "authorization": "initial"])
+    #expect(await sent.next() == ["type": "renew", "live_id": "7", "authorization": "replacement"])
+    socket.deliver(#"{"type":"renewed","live_id":"7"}"#)
+    socket.deliver(#"{"type":"progress","mvcc":\#(visibility)}"#)
+    guard case .event(.progress) = try await updates.next() else {
+        Issue.record("Expected progress after renewal")
+        await subscription.stop()
+        return
+    }
+
+    #expect(socketsOpened.withLock { $0 } == 1)
+    #expect(loads.withLock { $0 } == 3)
+    #expect(await subscription.state == .live)
+    await subscription.stop()
+}
+
+@Test(.timeLimit(.minutes(1)))
+func renewalRejectsAnAcknowledgementForADifferentSubscription() async throws {
+    let socket = WaitingWebSocket(initialFrames: renewalBaseline)
+    let loads = OSAllocatedUnfairLock(initialState: 0)
+    let client = RealtimeClient(url: try #require(URL(string: "wss://example.com/live"))) { _ in socket }
+    let subscription = client.subscription {
+        loads.withLock { count in
+            count += 1
+            return count == 1
+                ? renewalQuery("initial", expiresIn: 500)
+                : renewalQuery("replacement", expiresIn: 60_000)
+        }
+    }
+    var updates = await subscription.updates().makeAsyncIterator()
+    var sent = socket.sentMessages.stream.makeAsyncIterator()
+    while let message = await sent.next(), message["type"] != "renew" {}
+    socket.deliver(#"{"type":"renewed","live_id":"8"}"#)
+    await #expect(throws: NeonRealtimeError.protocolViolation("Unexpected renewal acknowledgement")) {
+        while try await updates.next() != nil {}
+    }
+    #expect(await subscription.state == .failed)
+}
+
+@Test(.timeLimit(.minutes(1)))
+func renewalTimeoutReconnectsEvenWhileTheSocketIsStillReceiving() async throws {
+    let first = WaitingWebSocket(initialFrames: renewalBaseline)
+    let second = WaitingWebSocket(initialFrames: renewalBaseline)
+    let socketsOpened = OSAllocatedUnfairLock(initialState: 0)
+    let loads = OSAllocatedUnfairLock(initialState: 0)
+    let client = RealtimeClient(
+        url: try #require(URL(string: "wss://example.com/live")),
+        heartbeatIdle: .seconds(30),
+        heartbeatTimeout: .milliseconds(200)
+    ) { _ in
+        socketsOpened.withLock { count in
+            count += 1
+            return count == 1 ? first : second
+        }
+    }
+    let subscription = client.subscription {
+        loads.withLock { count in
+            count += 1
+            return renewalQuery("query-\(count)", expiresIn: count == 1 ? 500 : 60_000)
+        }
+    }
+    var updates = await subscription.updates().makeAsyncIterator()
+    #expect(try await updates.next() == .stateChanged(.connecting))
+    guard case .event(.snapshot) = try await updates.next() else {
+        Issue.record("Expected the initial snapshot")
+        await subscription.stop()
+        return
+    }
+    #expect(try await updates.next() == .stateChanged(.live))
+
+    var sent = first.sentMessages.stream.makeAsyncIterator()
+    while let message = await sent.next(), message["type"] != "renew" {}
+    // A separate server frame can arrive while the renewal is unanswered.
+    first.deliver(#"{"type":"progress","mvcc":\#(visibility)}"#)
+    guard case .event(.progress) = try await updates.next() else {
+        Issue.record("Expected progress while the renewal was pending")
+        await subscription.stop()
+        return
+    }
+    #expect(try await updates.next() == .stateChanged(.reconnecting))
+    guard case .event(.snapshot) = try await updates.next() else {
+        Issue.record("Expected a replacement snapshot after the timeout")
+        await subscription.stop()
+        return
+    }
+    #expect(try await updates.next() == .stateChanged(.live))
+    #expect(socketsOpened.withLock { $0 } == 2)
+    #expect(loads.withLock { $0 } == 3)
+    await subscription.stop()
+}
+
+private var renewalBaseline: [String] {
+    [
+        #"{"type":"ready"}"#,
+        admission,
+        baselineStart(),
+        baselineBatch(index: 0, rows: #"[{"row_key":"\#(rowA)","values":["5",null]}]"#),
+        baselineEnd(count: 1),
+    ]
+}
+
+private func renewalQuery(_ capability: String, expiresIn milliseconds: Int64) -> SealedLiveQuery {
+    SealedLiveQuery(
+        capability: capability,
+        queryFingerprint: "fingerprint",
+        expiresAt: Int64(Date.now.timeIntervalSince1970 * 1_000) + milliseconds
+    )
+}
+
 @discardableResult
 private func apply(_ json: String, to state: inout NeonSubscriptionState) throws -> [NeonRealtimeEvent] {
     let decoder = JSONDecoder()
@@ -362,6 +587,7 @@ private struct WaitingWebSocket: NeonWebSocket {
     let receiving = AsyncStream<Void>.makeStream()
     let closed = AsyncStream<Void>.makeStream()
     let probes = AsyncStream<String>.makeStream()
+    let sentMessages = AsyncStream<[String: String]>.makeStream()
     private let frames = AsyncStream<String>.makeStream()
 
     init(initialFrames: [String] = []) {
@@ -374,9 +600,14 @@ private struct WaitingWebSocket: NeonWebSocket {
 
     func send(_ text: String) throws {
         let message = try JSONDecoder().decode([String: String].self, from: Data(text.utf8))
+        sentMessages.continuation.yield(message)
         if message["type"] == "ping", let token = message["token"] {
             probes.continuation.yield(token)
         }
+    }
+
+    func deliver(_ frame: String) {
+        frames.continuation.yield(frame)
     }
 
     func respond(to token: String) {
@@ -393,6 +624,7 @@ private struct WaitingWebSocket: NeonWebSocket {
     func close() {
         frames.continuation.finish()
         probes.continuation.finish()
+        sentMessages.continuation.finish()
         closed.continuation.yield(())
         closed.continuation.finish()
     }

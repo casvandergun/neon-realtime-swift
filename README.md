@@ -8,13 +8,13 @@ Add the package and link the `NeonRealtimeSwift` product to your target.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/casvandergun/neon-realtime-swift.git", from: "0.2.0")
+    .package(url: "https://github.com/casvandergun/neon-realtime-swift.git", from: "0.2.1")
 ]
 ```
 
 ## Subscribing
 
-A `RealtimeClient` creates a `RawLiveQuerySubscription` for a `SealedLiveQuery`. The subscription keeps streaming across recoverable disconnects. Its loader supplies a fresh capability for the same query on each connection attempt.
+A `RealtimeClient` creates a `RawLiveQuerySubscription` for a `SealedLiveQuery`. The subscription keeps streaming across recoverable disconnects. Its loader supplies a fresh capability for the same SQL and parameters on connection attempts and before expiry. Successful renewal keeps the active WebSocket and row IDs. Change batches continue without a replacement snapshot.
 
 ```swift
 import NeonRealtimeSwift
@@ -31,7 +31,9 @@ for try await update in await subscription.updates() {
 }
 ```
 
-A replacement snapshot starts a new row ID namespace. Call `await subscription.stop()` or cancel the consuming task to stop sync. The same handle can start again with the same query. For a failed HTTP seal request, throw `NeonRealtimeSubscriptionError.sealHTTPStatus(statusCode)` so the session can classify 408, 429, and 5xx as retryable.
+The subscription calls `loadQuery` while the stream is healthy to obtain a capability with a later expiry. Have your authenticated endpoint seal the same SQL and parameters on every request and return the fresh envelope. For HTTP errors, throw `NeonRealtimeSubscriptionError.sealHTTPStatus(statusCode)`. The client retries 408, 429, and 5xx while the current capability is valid. If the capability expires or Neon does not acknowledge renewal, the client reconnects and obtains a replacement snapshot.
+
+A replacement snapshot starts a new row ID namespace. Call `await subscription.stop()` or cancel the consuming task to stop sync. The same handle can start again with the same query.
 
 ### Single connection attempt
 

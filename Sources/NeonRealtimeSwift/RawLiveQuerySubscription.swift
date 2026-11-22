@@ -1,5 +1,11 @@
 import Foundation
 
+typealias LoadRenewedQuery = @Sendable (SealedLiveQuery) async throws -> SealedLiveQuery
+typealias OpenRealtimeConnection = @Sendable (
+    SealedLiveQuery,
+    @escaping LoadRenewedQuery
+) -> AsyncThrowingStream<NeonRealtimeEvent, Error>
+
 public enum NeonRealtimeSubscriptionError: Error, Sendable, Equatable {
     case alreadyActive
     case queryFingerprintChanged
@@ -33,7 +39,7 @@ public actor RawLiveQuerySubscription {
     }
 
     private let loadQuery: @Sendable () async throws -> SealedLiveQuery
-    private let subscribe: @Sendable (SealedLiveQuery) -> AsyncThrowingStream<NeonRealtimeEvent, Error>
+    private let connect: OpenRealtimeConnection
     private let sleepBeforeRetry: @Sendable (Duration) async throws -> Void
     private var run: Run?
     private var queryFingerprint: String?
@@ -43,8 +49,16 @@ public actor RawLiveQuerySubscription {
         subscribe: @escaping @Sendable (SealedLiveQuery) -> AsyncThrowingStream<NeonRealtimeEvent, Error>,
         sleepBeforeRetry: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
+        self.init(loadQuery: loadQuery, connect: { query, _ in subscribe(query) }, sleepBeforeRetry: sleepBeforeRetry)
+    }
+
+    init(
+        loadQuery: @escaping @Sendable () async throws -> SealedLiveQuery,
+        connect: @escaping OpenRealtimeConnection,
+        sleepBeforeRetry: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
         self.loadQuery = loadQuery
-        self.subscribe = subscribe
+        self.connect = connect
         self.sleepBeforeRetry = sleepBeforeRetry
     }
 
@@ -89,7 +103,7 @@ public actor RawLiveQuerySubscription {
                     throw NeonRealtimeSubscriptionError.queryFingerprintChanged
                 }
                 queryFingerprint = query.queryFingerprint
-                for try await event in subscribe(query) {
+                for try await event in connect(query, loadRenewal(after:)) {
                     try Task.checkCancellation()
                     run?.continuation.yield(.event(event))
                     if case .snapshot = event {
@@ -116,6 +130,47 @@ public actor RawLiveQuerySubscription {
                 backoff = min(backoff * 2, .seconds(15))
             }
         }
+    }
+
+    private nonisolated func loadRenewal(after current: SealedLiveQuery) async throws -> SealedLiveQuery {
+        let remaining = max(.zero, timeUntilExpiry(of: current))
+        // Keep a lead time for the HTTP request and acknowledgement. For a
+        // short-lived query, wait for half its remaining lifetime instead.
+        try await Task.sleep(for: remaining - min(.seconds(10), remaining / 2))
+
+        var backoff = Duration.seconds(1)
+        while true {
+            try Task.checkCancellation()
+            let retryDelay: Duration
+            do {
+                let replacement = try await loadQuery()
+                try Task.checkCancellation()
+                guard replacement.queryFingerprint == current.queryFingerprint else {
+                    throw NeonRealtimeSubscriptionError.queryFingerprintChanged
+                }
+                guard replacement.hasValidCapability else { throw NeonRealtimeError.invalidSealedQuery }
+                if replacement.capability != current.capability,
+                   replacement.expiresAt > current.expiresAt,
+                   timeUntilExpiry(of: replacement) > .zero {
+                    return replacement
+                }
+                // A cached envelope cannot extend the current authorization.
+                retryDelay = backoff
+            } catch {
+                guard let delay = Self.retryDelay(after: error, backoff: backoff) else { throw error }
+                retryDelay = delay
+            }
+
+            let remaining = timeUntilExpiry(of: current)
+            guard remaining > .zero else { throw URLError(.timedOut) }
+            try await sleepBeforeRetry(min(retryDelay, remaining))
+            guard timeUntilExpiry(of: current) > .zero else { throw URLError(.timedOut) }
+            backoff = min(backoff * 2, .seconds(15))
+        }
+    }
+
+    private nonisolated func timeUntilExpiry(of query: SealedLiveQuery) -> Duration {
+        .seconds(Double(query.expiresAt) / 1_000 - Date.now.timeIntervalSince1970)
     }
 
     private func transition(to state: State) {

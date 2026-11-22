@@ -7,6 +7,10 @@ public struct SealedLiveQuery: Codable, Sendable {
     /// Unix time in milliseconds.
     public let expiresAt: Int64
 
+    var hasValidCapability: Bool {
+        !capability.isEmpty && capability.utf8.count <= 262_144
+    }
+
     public init(capability: String, queryFingerprint: String, expiresAt: Int64) {
         self.capability = capability
         self.queryFingerprint = queryFingerprint
